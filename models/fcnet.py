@@ -29,7 +29,8 @@ class MyFullyConnectedNetwork(TorchModelV2, nn.Module):
             self, obs_space, action_space, num_outputs, model_config, name
         )
         nn.Module.__init__(self)
-        self.n_agents = len(obs_space.original_space)
+        obs_space = getattr(obs_space, "original_space", obs_space)
+        self.n_agents = len(obs_space)
         self.outputs_per_agent = num_outputs // self.n_agents
         self.trainer = cfg["trainer"]
         self.heterogeneous = cfg["heterogeneous"]
@@ -43,7 +44,7 @@ class MyFullyConnectedNetwork(TorchModelV2, nn.Module):
 
         assert not cfg["share_observations"]
 
-        self.obs_shape = obs_space.original_space[0].shape[0]
+        self.obs_shape = obs_space[0].shape[0]
         # Remove position
         self.obs_shape -= self.pos_dim
         if self.add_agent_index:
@@ -67,10 +68,18 @@ class MyFullyConnectedNetwork(TorchModelV2, nn.Module):
         state: List[TensorType],
         seq_lens: TensorType,
     ) -> (TensorType, List[TensorType]):
-        batch_size = input_dict["obs"][0].shape[0]
-        device = input_dict["obs"][0].device
-
-        obs = torch.stack(input_dict["obs"], dim=1)
+        obs_input = input_dict["obs"]
+        if isinstance(obs_input, torch.Tensor):
+            if obs_input.dim() == 2:
+                obs = obs_input.view(obs_input.shape[0], self.n_agents, -1)
+            else:
+                obs = obs_input
+            batch_size = obs.shape[0]
+            device = obs.device
+        else:
+            batch_size = obs_input[0].shape[0]
+            device = obs_input[0].device
+            obs = torch.stack(obs_input, dim=1)
         if self.add_agent_index:
             agent_index = (
                 torch.arange(self.n_agents, device=device)

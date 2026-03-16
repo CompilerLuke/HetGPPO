@@ -97,7 +97,7 @@ class RelVel(BaseTransform):
     def __init__(self):
         pass
 
-    def __call__(self, data):
+    def forward(self, data):
         (row, col), vel, pseudo = data.edge_index, data.vel, data.edge_attr
 
         cart = vel[row] - vel[col]
@@ -476,7 +476,8 @@ class GPPO(TorchModelV2, nn.Module):
 
         topology_types = {"full", "ring", "line"}
 
-        self.n_agents = len(obs_space.original_space)
+        obs_space = getattr(obs_space, "original_space", obs_space)
+        self.n_agents = len(obs_space)
         self.outputs_per_agent = int(num_outputs / self.n_agents)
         self._cur_value = None
 
@@ -504,7 +505,7 @@ class GPPO(TorchModelV2, nn.Module):
         if self.centralised_critic and self.share_action_value:
             assert self.use_mlp
 
-        self.obs_shape = obs_space.original_space[0].shape[0]
+        self.obs_shape = obs_space[0].shape[0]
         # Remove position
         self.obs_shape -= self.pos_dim
         if self.add_agent_index:
@@ -574,11 +575,18 @@ class GPPO(TorchModelV2, nn.Module):
 
     @override(ModelV2)
     def forward(self, input_dict, state, seq_lens):
-        # print(f"Obs len: {len(input_dict['obs'])}\n Single obs shape: {input_dict['obs'][0].shape}")
-        batch_size = input_dict["obs"][0].shape[0]
-        device = input_dict["obs"][0].device
-
-        obs = torch.stack(input_dict["obs"], dim=1)
+        obs_input = input_dict["obs"]
+        if isinstance(obs_input, torch.Tensor):
+            if obs_input.dim() == 2:
+                obs = obs_input.view(obs_input.shape[0], self.n_agents, -1)
+            else:
+                obs = obs_input
+            batch_size = obs.shape[0]
+            device = obs.device
+        else:
+            batch_size = obs_input[0].shape[0]
+            device = obs_input[0].device
+            obs = torch.stack(obs_input, dim=1)
         if self.add_agent_index:
             agent_index = (
                 torch.arange(self.n_agents, device=device)

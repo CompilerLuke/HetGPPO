@@ -3,8 +3,11 @@
 #  All rights reserved.
 import copy
 import hashlib
+import os
 import pickle
 import platform
+import types
+import uuid
 from enum import Enum
 from pathlib import Path
 from typing import Dict, Optional, Tuple, Set, Callable
@@ -13,13 +16,13 @@ from typing import Union
 import ray
 import torch
 import vmas
-import wandb
+import imageio
 from ray.rllib import RolloutWorker, BaseEnv, Policy, VectorEnv
 from ray.rllib.algorithms.callbacks import DefaultCallbacks
 from ray.rllib.evaluation import Episode
 from ray.rllib.models import ModelCatalog
 from ray.rllib.utils.typing import PolicyID
-from ray.tune import register_env
+from ray.tune.registry import register_env
 from torch import nn, Tensor
 from vmas import make_env
 from vmas.simulator.environment import Environment
@@ -35,10 +38,11 @@ from rllib_differentiable_comms.multi_trainer import MultiPPOTrainer
 
 
 class PathUtils:
-    scratch_dir = (
-        Path("/Users/Matteo/scratch/")
-        if platform.system() == "Darwin"
-        else Path("/local/scratch/mb2389/")
+    scratch_dir = Path(
+        os.environ.get(
+            "HETGPPO_SCRATCH_DIR",
+            "/tmp/hetgppo",
+        )
     )
     gppo_dir = Path(__file__).parent.resolve()
     result_dir = gppo_dir / "results"
@@ -69,8 +73,10 @@ class InjectMode(Enum):
 class TrainingUtils:
     @staticmethod
     def init_ray(scenario_name: str, local_mode: bool = False):
+        (PathUtils.scratch_dir / "ray").mkdir(parents=True, exist_ok=True)
         if not ray.is_initialized():
             ray.init(
+                address="local",
                 _temp_dir=str(PathUtils.scratch_dir / "ray"),
                 local_mode=local_mode,
             )
@@ -96,6 +102,36 @@ class TrainingUtils:
             # Scenario specific
             **config["scenario_config"],
         )
+        if hasattr(env, "vector_reset"):
+            original_vector_reset = env.vector_reset
+
+            def vector_reset_compat(self, *args, **kwargs):
+                observations = original_vector_reset(*args, **kwargs)
+                return observations, [{} for _ in range(self.num_envs)]
+
+            env.vector_reset = types.MethodType(vector_reset_compat, env)
+
+        if hasattr(env, "reset_at"):
+            original_reset_at = env.reset_at
+
+            def reset_at_compat(self, index=None, *args, **kwargs):
+                observations = original_reset_at(index=index)
+                return observations, {}
+
+            env.reset_at = types.MethodType(reset_at_compat, env)
+
+        if hasattr(env, "vector_step"):
+            original_vector_step = env.vector_step
+
+            def vector_step_compat(self, actions):
+                step_result = original_vector_step(actions)
+                if len(step_result) == 5:
+                    return step_result
+                observations, rewards, terminateds, infos = step_result
+                truncateds = [False for _ in terminateds]
+                return observations, rewards, terminateds, truncateds, infos
+
+            env.vector_step = types.MethodType(vector_step_compat, env)
         return env
 
     class EvaluationCallbacks(DefaultCallbacks):
@@ -159,10 +195,12 @@ class TrainingUtils:
             episode: Episode,
             **kwargs,
         ) -> None:
-            vid = np.transpose(self.frames, (0, 3, 1, 2))
-            episode.media["rendering"] = wandb.Video(
-                vid, fps=1 / base_env.vector_env.env.world.dt, format="mp4"
-            )
+            video_dir = PathUtils.rollout_storage / "tensorboard_eval_videos"
+            video_dir.mkdir(parents=True, exist_ok=True)
+            video_path = video_dir / f"{uuid.uuid4().hex}.gif"
+            fps = max(1, int(round(1 / base_env.vector_env.env.world.dt)))
+            imageio.mimsave(video_path, self.frames, format="GIF", fps=fps)
+            episode.media["rendering_path"] = str(video_path)
             self.frames = []
 
     class HeterogeneityMeasureCallbacks(DefaultCallbacks):
@@ -185,6 +223,8 @@ class TrainingUtils:
             episode: Episode,
             **kwargs,
         ) -> None:
+            if not hasattr(episode, "last_raw_obs_for"):
+                return
             obs = episode.last_raw_obs_for()
             act = episode.last_action_for()
             info = episode.last_info_for()
@@ -205,6 +245,8 @@ class TrainingUtils:
             episode: Episode,
             **kwargs,
         ) -> None:
+            if not self.all_obs:
+                return
             self.env: Environment = base_env.vector_env.env
             self.n_agents = self.env.n_agents
             self.input_lens = [
